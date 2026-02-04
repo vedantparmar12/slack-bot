@@ -7,6 +7,19 @@ import tiktoken
 
 from src.config import settings
 
+# OpenAI embedding model max input tokens
+EMBEDDING_MAX_TOKENS = 8191
+# Safety margin below the hard limit
+EMBEDDING_SAFE_LIMIT = 8000
+# Maximum document size we'll process (in characters, ~500k tokens)
+MAX_DOCUMENT_CHARS = 2_000_000
+
+# Sentence splitting pattern (handles ., !, ?, and common abbreviations)
+_SENTENCE_SPLIT = re.compile(
+    r"(?<=[.!?])\s+(?=[A-Z])"
+    r"|(?<=[.!?])\s*\n"
+)
+
 
 @dataclass
 class TextChunk:
@@ -16,7 +29,8 @@ class TextChunk:
 
 
 class SmartChunker:
-    """Hierarchy-aware chunker that preserves document structure."""
+    """Hybrid chunker: hierarchy-aware for docs, conversation-aware for Slack,
+    with code block preservation and embedding-safe token limits."""
 
     def __init__(
         self,
@@ -27,6 +41,8 @@ class SmartChunker:
         self.target_tokens = target_tokens
         self.max_tokens = max_tokens
         self.overlap_tokens = overlap_tokens
+        # Hard ceiling: chunks must never exceed embedding model input limit
+        self.absolute_max = EMBEDDING_SAFE_LIMIT
         self.encoder = tiktoken.encoding_for_model("gpt-4o")
 
     def count_tokens(self, text: str) -> int:
@@ -40,6 +56,11 @@ class SmartChunker:
     ) -> list[TextChunk]:
         metadata = metadata or {}
 
+        # Guard: truncate absurdly large documents
+        if len(content) > MAX_DOCUMENT_CHARS:
+            content = content[:MAX_DOCUMENT_CHARS]
+            metadata["truncated"] = True
+
         if source_type == "slack":
             return self._chunk_slack(content, metadata)
         elif source_type in ("confluence", "git"):
@@ -47,10 +68,18 @@ class SmartChunker:
         else:
             return self._chunk_plain(content, metadata)
 
-    def _chunk_slack(self, content: str, metadata: dict) -> list[TextChunk]:
-        """Keep Slack threads as single chunks when possible."""
-        tokens = self.count_tokens(content)
+    # ---- Slack: conversation-aware chunking ----
 
+    def _chunk_slack(self, content: str, metadata: dict) -> list[TextChunk]:
+        """Split Slack threads preserving Q&A pairs.
+
+        Strategy:
+        1. If thread fits in one chunk, keep it whole.
+        2. Otherwise, split by message boundaries (double newline),
+           grouping consecutive messages into chunks that keep
+           question + answer together.
+        """
+        tokens = self.count_tokens(content)
         if tokens <= self.max_tokens:
             return [
                 TextChunk(
@@ -60,19 +89,77 @@ class SmartChunker:
                 )
             ]
 
-        # Thread too long, split by messages (double newline)
-        return self._split_with_overlap(content, metadata, chunk_type="slack_thread_part")
+        # Split by individual messages (each message starts with [username]:)
+        messages = re.split(r"\n\n(?=\[)", content)
+        if not messages or len(messages) == 1:
+            # Fallback: split by double newline
+            return self._split_with_overlap(content, metadata, chunk_type="slack_thread_part")
+
+        # Group messages into chunks, keeping Q&A pairs together
+        chunks: list[TextChunk] = []
+        current_msgs: list[str] = []
+        current_tokens = 0
+
+        for msg in messages:
+            msg = msg.strip()
+            if not msg:
+                continue
+            msg_tokens = self.count_tokens(msg)
+
+            # Single message exceeds limit — split it further
+            if msg_tokens > self.max_tokens:
+                # Flush buffer
+                if current_msgs:
+                    chunks.append(self._make_chunk(
+                        "\n\n".join(current_msgs), metadata, "slack_thread_part"
+                    ))
+                    current_msgs = []
+                    current_tokens = 0
+                # Split the oversized message
+                chunks.extend(self._split_with_overlap(
+                    msg, metadata, chunk_type="slack_message_part"
+                ))
+                continue
+
+            if current_tokens + msg_tokens > self.target_tokens and current_msgs:
+                chunks.append(self._make_chunk(
+                    "\n\n".join(current_msgs), metadata, "slack_thread_part"
+                ))
+
+                # Overlap: keep last message as context bridge
+                last_msg = current_msgs[-1]
+                last_tokens = self.count_tokens(last_msg)
+                if last_tokens <= self.overlap_tokens:
+                    current_msgs = [last_msg]
+                    current_tokens = last_tokens
+                else:
+                    current_msgs = []
+                    current_tokens = 0
+
+            current_msgs.append(msg)
+            current_tokens += msg_tokens
+
+        if current_msgs:
+            chunks.append(self._make_chunk(
+                "\n\n".join(current_msgs), metadata, "slack_thread_part"
+            ))
+
+        return chunks if chunks else [self._make_chunk(content, metadata, "slack_thread")]
+
+    # ---- Markdown: hierarchy + code-block aware chunking ----
 
     def _chunk_markdown(self, content: str, metadata: dict) -> list[TextChunk]:
-        """Split on markdown headings, preserving hierarchy."""
-        # Split by headings (H1, H2, H3)
-        heading_pattern = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
-        sections = []
+        """Split on markdown headings, preserving code blocks intact."""
+        # Step 1: Extract and protect code blocks
+        content, code_blocks = self._protect_code_blocks(content)
+
+        # Step 2: Split by headings (H1–H4)
+        heading_pattern = re.compile(r"^(#{1,4})\s+(.+)$", re.MULTILINE)
+        sections: list[tuple[list[str], str]] = []
         last_end = 0
         heading_chain: list[str] = []
 
         for match in heading_pattern.finditer(content):
-            # Save content before this heading
             if last_end < match.start():
                 text = content[last_end : match.start()].strip()
                 if text:
@@ -80,28 +167,29 @@ class SmartChunker:
 
             level = len(match.group(1))
             title = match.group(2).strip()
-
-            # Update heading chain
             heading_chain = heading_chain[: level - 1]
             while len(heading_chain) < level:
                 heading_chain.append("")
             heading_chain[level - 1] = title
             last_end = match.end()
 
-        # Remaining content after last heading
         remaining = content[last_end:].strip()
         if remaining:
             sections.append((list(heading_chain), remaining))
 
         if not sections:
-            return self._chunk_plain(content, metadata)
+            restored = self._restore_code_blocks(content, code_blocks)
+            return self._chunk_plain(restored, metadata)
 
-        # Merge small sections and split large ones
+        # Step 3: Merge small sections, split large ones
         chunks: list[TextChunk] = []
         buffer_text = ""
         buffer_headings: list[str] = []
 
         for headings, text in sections:
+            # Restore code blocks in this section
+            text = self._restore_code_blocks(text, code_blocks)
+
             combined = f"{buffer_text}\n\n{text}".strip() if buffer_text else text
             combined_tokens = self.count_tokens(combined)
 
@@ -109,66 +197,83 @@ class SmartChunker:
                 buffer_text = combined
                 buffer_headings = headings or buffer_headings
             else:
-                # Flush buffer if it has content
                 if buffer_text:
-                    tokens = self.count_tokens(buffer_text)
-                    if tokens <= self.max_tokens:
-                        chunks.append(
-                            TextChunk(
-                                text=buffer_text,
-                                token_count=tokens,
-                                metadata={
-                                    **metadata,
-                                    "heading_chain": buffer_headings,
-                                    "chunk_type": "markdown_section",
-                                },
-                            )
-                        )
-                    else:
-                        chunks.extend(
-                            self._split_with_overlap(
-                                buffer_text,
-                                {**metadata, "heading_chain": buffer_headings},
-                                chunk_type="markdown_section_part",
-                            )
-                        )
+                    self._flush_section(
+                        buffer_text, buffer_headings, metadata, chunks
+                    )
 
-                # Start new buffer
                 text_tokens = self.count_tokens(text)
                 if text_tokens <= self.target_tokens:
                     buffer_text = text
                     buffer_headings = headings
                 else:
-                    # Section itself is too large, split it
-                    chunks.extend(
-                        self._split_with_overlap(
-                            text,
-                            {**metadata, "heading_chain": headings},
-                            chunk_type="markdown_section_part",
-                        )
-                    )
+                    self._flush_section(text, headings, metadata, chunks)
                     buffer_text = ""
                     buffer_headings = []
 
-        # Flush remaining buffer
         if buffer_text:
-            tokens = self.count_tokens(buffer_text)
+            self._flush_section(buffer_text, buffer_headings, metadata, chunks)
+
+        return chunks if chunks else self._chunk_plain(
+            self._restore_code_blocks(content, code_blocks), metadata
+        )
+
+    def _flush_section(
+        self,
+        text: str,
+        headings: list[str],
+        metadata: dict,
+        chunks: list[TextChunk],
+    ):
+        """Add a section as one or more chunks, splitting if too large."""
+        tokens = self.count_tokens(text)
+        if tokens <= self.max_tokens:
             chunks.append(
                 TextChunk(
-                    text=buffer_text,
+                    text=text,
                     token_count=tokens,
                     metadata={
                         **metadata,
-                        "heading_chain": buffer_headings,
+                        "heading_chain": headings,
                         "chunk_type": "markdown_section",
                     },
                 )
             )
+        else:
+            chunks.extend(
+                self._split_with_overlap(
+                    text,
+                    {**metadata, "heading_chain": headings},
+                    chunk_type="markdown_section_part",
+                )
+            )
 
-        return chunks if chunks else self._chunk_plain(content, metadata)
+    @staticmethod
+    def _protect_code_blocks(text: str) -> tuple[str, dict[str, str]]:
+        """Replace fenced code blocks with placeholders so they aren't split mid-block."""
+        code_blocks: dict[str, str] = {}
+        counter = 0
+
+        def replacer(match):
+            nonlocal counter
+            key = f"__CODE_BLOCK_{counter}__"
+            code_blocks[key] = match.group(0)
+            counter += 1
+            return key
+
+        protected = re.sub(r"```[\s\S]*?```", replacer, text)
+        return protected, code_blocks
+
+    @staticmethod
+    def _restore_code_blocks(text: str, code_blocks: dict[str, str]) -> str:
+        """Restore code block placeholders to their original content."""
+        for key, code in code_blocks.items():
+            text = text.replace(key, code)
+        return text
+
+    # ---- Plain text / fallback ----
 
     def _chunk_plain(self, content: str, metadata: dict) -> list[TextChunk]:
-        """Fallback: split by paragraphs with overlap."""
         return self._split_with_overlap(content, metadata, chunk_type="plain")
 
     def _split_with_overlap(
@@ -177,40 +282,60 @@ class SmartChunker:
         metadata: dict,
         chunk_type: str = "plain",
     ) -> list[TextChunk]:
-        """Split text into overlapping chunks by sentence/paragraph boundaries."""
-        # Split by paragraphs first, then by sentences
+        """Split text into overlapping chunks by paragraph/sentence boundaries.
+
+        Falls back to sentence splitting for oversized paragraphs,
+        and to hard token slicing as a last resort.
+        """
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         if not paragraphs:
             paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
         if not paragraphs:
-            tokens = self.count_tokens(text)
-            return [
-                TextChunk(
-                    text=text,
-                    token_count=tokens,
-                    metadata={**metadata, "chunk_type": chunk_type},
-                )
-            ]
+            return [self._make_chunk(text, metadata, chunk_type)]
+
+        # Expand: if any paragraph exceeds max_tokens, split it by sentences
+        expanded: list[str] = []
+        for para in paragraphs:
+            para_tokens = self.count_tokens(para)
+            if para_tokens <= self.max_tokens:
+                expanded.append(para)
+            else:
+                # Try sentence splitting
+                sentences = _SENTENCE_SPLIT.split(para)
+                if len(sentences) > 1:
+                    for sent in sentences:
+                        sent = sent.strip()
+                        if sent:
+                            expanded.append(sent)
+                else:
+                    # Last resort: hard-split by tokens
+                    expanded.extend(self._hard_split(para))
 
         chunks: list[TextChunk] = []
         current_parts: list[str] = []
         current_tokens = 0
 
-        for para in paragraphs:
-            para_tokens = self.count_tokens(para)
+        for part in expanded:
+            part_tokens = self.count_tokens(part)
 
-            if current_tokens + para_tokens > self.target_tokens and current_parts:
-                # Flush current chunk
-                chunk_text = "\n\n".join(current_parts)
-                chunks.append(
-                    TextChunk(
-                        text=chunk_text,
-                        token_count=self.count_tokens(chunk_text),
-                        metadata={**metadata, "chunk_type": chunk_type},
-                    )
-                )
+            # Single part still over absolute max → hard split
+            if part_tokens > self.absolute_max:
+                if current_parts:
+                    chunks.append(self._make_chunk(
+                        "\n\n".join(current_parts), metadata, chunk_type
+                    ))
+                    current_parts = []
+                    current_tokens = 0
+                for sub in self._hard_split(part):
+                    chunks.append(self._make_chunk(sub, metadata, chunk_type))
+                continue
 
-                # Keep overlap: find how many trailing paragraphs fit in overlap budget
+            if current_tokens + part_tokens > self.target_tokens and current_parts:
+                chunks.append(self._make_chunk(
+                    "\n\n".join(current_parts), metadata, chunk_type
+                ))
+
+                # Keep overlap
                 overlap_parts: list[str] = []
                 overlap_tokens = 0
                 for p in reversed(current_parts):
@@ -223,18 +348,38 @@ class SmartChunker:
                 current_parts = overlap_parts
                 current_tokens = overlap_tokens
 
-            current_parts.append(para)
-            current_tokens += para_tokens
+            current_parts.append(part)
+            current_tokens += part_tokens
 
-        # Flush remaining
         if current_parts:
-            chunk_text = "\n\n".join(current_parts)
-            chunks.append(
-                TextChunk(
-                    text=chunk_text,
-                    token_count=self.count_tokens(chunk_text),
-                    metadata={**metadata, "chunk_type": chunk_type},
-                )
-            )
+            chunks.append(self._make_chunk(
+                "\n\n".join(current_parts), metadata, chunk_type
+            ))
 
         return chunks
+
+    def _hard_split(self, text: str) -> list[str]:
+        """Split text into pieces that each fit within absolute_max tokens.
+        Uses token-level slicing as a last resort for content that has
+        no paragraph or sentence boundaries (e.g. minified code, base64).
+        """
+        tokens = self.encoder.encode(text)
+        pieces = []
+        for i in range(0, len(tokens), self.absolute_max):
+            chunk_tokens = tokens[i : i + self.absolute_max]
+            pieces.append(self.encoder.decode(chunk_tokens))
+        return pieces
+
+    def _make_chunk(self, text: str, metadata: dict, chunk_type: str) -> TextChunk:
+        """Create a TextChunk, enforcing the embedding token safety limit."""
+        token_count = self.count_tokens(text)
+        if token_count > self.absolute_max:
+            # Truncate to fit (should rarely happen due to _hard_split)
+            tokens = self.encoder.encode(text)[: self.absolute_max]
+            text = self.encoder.decode(tokens)
+            token_count = self.absolute_max
+        return TextChunk(
+            text=text,
+            token_count=token_count,
+            metadata={**metadata, "chunk_type": chunk_type},
+        )
